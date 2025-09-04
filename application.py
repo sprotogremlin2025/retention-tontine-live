@@ -1,12 +1,9 @@
-from flask import Flask, send_from_directory
+from flask import Flask, render_template
 app = Flask(__name__, static_folder="static")
 
 @app.route("/")
 def index():
-    return send_from_directory("templates", "app.html")
+    return render_template("app.html")
 
-# Optional: serve other static files (css/js)
-@app.route("/<path:path>")
-def static_proxy(path):
-    return send_from_directory("templates", path)
+
 
