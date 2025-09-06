@@ -57,7 +57,7 @@ contract TontineERC20_ExcludeSelf {
 
     function getAccount(address user) external view returns (uint256 entitlement, uint256 deposited) {
         Account storage a = accounts[user];
-        entitlement = a.entitlement + _pending(user, a);
+        entitlement = a.entitlement + _pending(a);
         deposited = a.deposited;
     }
 
@@ -75,7 +75,7 @@ contract TontineERC20_ExcludeSelf {
         Account storage a = accounts[msg.sender];
 
         // Harvest existing pending fees first
-        _harvest(msg.sender, a);
+        _harvest(a);
 
         // Pull tokens
         token.safeTransferFrom(msg.sender, address(this), amount);
@@ -100,10 +100,10 @@ contract TontineERC20_ExcludeSelf {
         require(a.deposited >= amount, "insufficient deposited");
 
         // Harvest fees accrued so far (excludes user's own past penalties by construction)
-        _harvest(msg.sender, a);
+        _harvest(a);
 
         // Determine penalty rate
-        uint256 penaltyRate = _penaltyRate(msg.sender, amount, a.deposited);
+        uint256 penaltyRate = _penaltyRate(amount, a.deposited);
         uint256 penalty = (amount * penaltyRate) / 100;
         uint256 payout = amount - penalty;
 
@@ -114,7 +114,7 @@ contract TontineERC20_ExcludeSelf {
 
         // Distribute penalty to others (excludes msg.sender automatically)
         if (penalty > 0) {
-            _distributeFeeExcluding(msg.sender, penalty, a);
+            _distributeFeeExcluding(penalty, a);
         }
 
         // Pay out user's entitlement + principal less penalty
@@ -137,7 +137,7 @@ contract TontineERC20_ExcludeSelf {
 
     // ----- Internals -----
 
-    function _penaltyRate(address user, uint256 /*amount*/, uint256 userDeposited) internal view returns (uint256) {
+    function _penaltyRate(uint256 /*amount*/, uint256 userDeposited) internal view returns (uint256) {
         // Last man standing (only staker): no penalty anytime
         if (totalDeposits == userDeposited) return 0;
 
@@ -151,14 +151,14 @@ contract TontineERC20_ExcludeSelf {
         return 20;
     }
 
-    function _pending(address user, Account storage a) internal view returns (uint256) {
+    function _pending(Account storage a) internal view returns (uint256) {
         uint256 accumulated = (a.deposited * accFeePerShare) / ACC_PRECISION;
         if (accumulated <= a.rewardDebt) return 0;
         return accumulated - a.rewardDebt;
     }
 
-    function _harvest(address user, Account storage a) internal {
-        uint256 pending = _pending(user, a);
+    function _harvest(Account storage a) internal {
+        uint256 pending = _pending(a);
         if (pending > 0) {
             // Move from global pool to user's entitlement
             // (feePool tracks undistributed—reduce as we harvest)
@@ -174,7 +174,7 @@ contract TontineERC20_ExcludeSelf {
      * Implements: acc += amount / (totalDeposits - excluderDeposit)
      * and offsets excluder's rewardDebt so they don't accrue from their own penalty.
      */
-    function _distributeFeeExcluding(address excluder, uint256 amount, Account storage exAcc) internal {
+    function _distributeFeeExcluding(uint256 amount, Account storage exAcc) internal {
         if (amount == 0) return;
 
         uint256 base = totalDeposits; // NOTE: at this point we've already reduced totalDeposits for caller's withdrawal
