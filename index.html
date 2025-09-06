@@ -441,6 +441,21 @@
     const $dash = $("#dash");
 
     // --------- HELPERS ----------
+
+
+    async function readTokenAddr(ctr) {
+      // Prefer tokenAddress() if it's in the ABI and callable
+      if (typeof ctr.tokenAddress === "function") {
+        try { return await ctr.tokenAddress(); } catch (_) { /* fall through */ }
+      }
+      // Fallback to token() if present
+      if (typeof ctr.token === "function") {
+        return await ctr.token();
+      }
+      throw new Error("Contract ABI lacks tokenAddress() and token()");
+    }
+
+
     function fmtNum(x, decimals=6){
       try { return ethers.formatUnits(x ?? 0n, decimals); }
       catch { return String(x); }
@@ -554,7 +569,7 @@
       if(!rec || !rec.contract) return;
       try{
         const [token, enrollEnd, payout, tot, fee] = await Promise.all([
-          rec.contract.tokenAddress(),
+          readTokenAddr(rec.contract),          // <— patched
           rec.contract.enrollmentEnd(),
           rec.contract.payoutTime(),
           rec.contract.totalDeposits(),
@@ -580,6 +595,7 @@
         console.error("refreshOne failed", addr, e);
       }
     }
+
 
     function startAutoRefresh(addr){
       refreshOne(addr).catch(console.error);
@@ -707,10 +723,11 @@
       try{
         // fetch token + decimals via wallet provider
         const ctr = new ethers.Contract(addr, TONTINE_ABI, signer || provider);
-        const tokenAdr = await ctr.tokenAddress();
+        const tokenAdr = await readTokenAddr(ctr);
         const erc20 = new ethers.Contract(tokenAdr, ERC20_ABI, signer || provider);
         const dec = await erc20.decimals();
         addTontine(addr, Number(dec));
+
       }catch(e){
         console.error(e);
         alert("Could not bind to contract—are ABI, address, and network correct?");
@@ -725,7 +742,7 @@
       if(!signer) return alert("Connect wallet first.");
       try{
         await ensureWalletOnSelected();
-        const tokenAdr = await rec.contract.tokenAddress();
+        const tokenAdr = await readTokenAddr(rec.contract);
         const erc20 = new ethers.Contract(tokenAdr, ERC20_ABI, signer);
         const human = $(`#amtDep-${rec.addr}`).val().trim();
         if(!human) return alert("Enter amount to approve.");
