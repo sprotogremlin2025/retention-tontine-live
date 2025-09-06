@@ -1,82 +1,64 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.30;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
- * @title ERC20 Tontine (Partial Withdrawals + Multi-Deposit)
- * @notice
- *  - Multiple deposits allowed during enrollment.
- *  - Partial withdrawals: user picks an `amount` <= deposited.
- *  - On withdrawal (partial or full), user first receives feePool share
- *    proportional to (amount / totalDeposits) *before* applying any penalty.
- *  - The payout then uses the same phase rules as before:
- *      * Before enrollmentEnd: full payout on the withdrawn slice (no penalty)
- *      * Between enrollmentEnd and payoutTime:
- *           - If this withdrawal empties the pool (i.e., user becomes last staker and
- *             takes everything), NO penalty on the withdrawn slice.
- *           - Otherwise 20% penalty on the withdrawn slice goes to feePool.
- *      * After payoutTime: full payout (no penalty)
+ * Tontine over an arbitrary ERC20.
+ * - Multiple deposits during enrollment.
+ * - Partial withdrawals anytime; penalty logic:
+ *      * Before enrollment end: 0% penalty
+ *      * After payout time: 0% penalty
+ *      * Between: 20% penalty UNLESS last staker (penalty waived)
+ * - Fee (penalty) distributions exclude the payer from earning on their own fees.
+ * - No stranded fees: penalties go to others via accFeePerShare, harvested on actions.
  */
+contract TontineERC20_ExcludeSelf {
+    using SafeERC20 for IERC20;
 
-interface IERC20 {
-    function totalSupply() external view returns (uint256);
-    function balanceOf(address a) external view returns (uint256);
-    function allowance(address owner, address spender) external view returns (uint256);
-    function transfer(address to, uint256 amt) external returns (bool);
-    function transferFrom(address from, address to, uint256 amt) external returns (bool);
-    function decimals() external view returns (uint8);
-}
-
-abstract contract ReentrancyGuard {
-    uint256 private constant _NOT_ENTERED = 1;
-    uint256 private constant _ENTERED = 2;
-    uint256 private _status = _NOT_ENTERED;
-    modifier nonReentrant() {
-        require(_status == _NOT_ENTERED, "ReentrancyGuard: reentrant");
-        _status = _ENTERED;
-        _;
-        _status = _NOT_ENTERED;
-    }
-}
-
-contract ERC20Tontine is ReentrancyGuard {
-    struct Account {
-        uint256 entitlement; // claimable token amount (stake + accrued fee shares)
-        uint256 deposited;   // active stake
-    }
-
+    // ----- Config -----
     IERC20 public immutable token;
+    uint256 public immutable enrollmentEnd; // timestamp
+    uint256 public immutable payoutTime;    // timestamp
+
+    // ----- Accounting -----
+    uint256 public totalDeposits;       // active principal across all users
+    uint256 public feePool;             // undistributed fees not yet moved into user entitlements
+
+    // Accumulator for fee distributions
+    uint256 private constant ACC_PRECISION = 1e18;
+    uint256 private accFeePerShare;     // scaled by ACC_PRECISION
+
+    struct Account {
+        uint256 entitlement;  // claimable fees harvested for the user, paid out on withdrawals
+        uint256 deposited;    // principal currently staked
+        uint256 rewardDebt;   // deposited * accFeePerShare at last update (scaled)
+    }
 
     mapping(address => Account) public accounts;
 
-    uint256 public immutable enrollmentEnd; // end of deposit window
-    uint256 public immutable payoutTime;    // time after which full withdrawals are allowed
-
-    uint256 public feePool;        // accumulated mid-game penalties to distribute
-    uint256 public totalDeposits;  // sum of all active deposits
-
+    // ----- Events -----
     event Deposited(address indexed user, uint256 amount);
+    event FeeDistributed(address indexed user, uint256 shareFromPool);
     event PartialWithdrawn(address indexed user, uint256 amountRequested, uint256 paidOut, uint256 penaltyToPool);
     event WithdrawnAll(address indexed user, uint256 paidOut, uint256 penaltyToPool);
-    event FeeDistributed(address indexed user, uint256 shareFromPool);
 
-    /**
-     * @param _token ERC-20 token address to lock
-     * @param _enrollmentDuration seconds during which deposits are allowed (from deploy)
-     * @param _lockDuration seconds of lock AFTER enrollment ends (payoutTime = enrollmentEnd + lockDuration)
-     */
     constructor(address _token, uint256 _enrollmentDuration, uint256 _lockDuration) {
         require(_token != address(0), "token=0");
         token = IERC20(_token);
-
-        uint256 _enrollEnd = block.timestamp + _enrollmentDuration;
-        enrollmentEnd = _enrollEnd;
-        payoutTime = _enrollEnd + _lockDuration;
+        // enrollment starts now and ends after _enrollmentDuration seconds
+        enrollmentEnd = block.timestamp + _enrollmentDuration;
+        // payout (lock) ends after enrollment + _lockDuration seconds
+        payoutTime = enrollmentEnd + _lockDuration;
     }
 
-    // ---------- Views ----------
+    // ----- Views -----
 
-    function tokenAddress() external view returns (address) {
-        return address(token);
+    function getAccount(address user) external view returns (uint256 entitlement, uint256 deposited) {
+        Account storage a = accounts[user];
+        entitlement = a.entitlement + _pending(user, a);
+        deposited = a.deposited;
     }
 
     function timeUntilPayout() external view returns (uint256) {
@@ -84,118 +66,135 @@ contract ERC20Tontine is ReentrancyGuard {
         return payoutTime - block.timestamp;
     }
 
-    function getAccount(address user) external view returns (uint256 entitlement, uint256 deposited) {
-        Account storage a = accounts[user];
-        return (a.entitlement, a.deposited);
-    }
+    // ----- Core actions -----
 
-    // ---------- Core logic ----------
-
-    /**
-     * @notice Deposit `amount` tokens during the enrollment window.
-     *         Multiple deposits are allowed; this simply adds to your stake & entitlement.
-     *         Caller must approve this contract for at least `amount`.
-     */
-    function deposit(uint256 amount) external nonReentrant {
+    function deposit(uint256 amount) external {
         require(block.timestamp < enrollmentEnd, "Enrollment ended");
         require(amount > 0, "amount=0");
 
-        _safeTransferFrom(msg.sender, address(this), amount);
+        Account storage a = accounts[msg.sender];
 
-        Account storage user = accounts[msg.sender];
-        user.deposited += amount;
-        user.entitlement += amount; // mirrors base behavior: stake increases entitlement 1:1
+        // Harvest existing pending fees first
+        _harvest(msg.sender, a);
+
+        // Pull tokens
+        token.safeTransferFrom(msg.sender, address(this), amount);
+
+        // Update principal & global
+        a.deposited += amount;
         totalDeposits += amount;
+
+        // Reset rewardDebt to current index
+        a.rewardDebt = (a.deposited * accFeePerShare) / ACC_PRECISION;
 
         emit Deposited(msg.sender, amount);
     }
 
     /**
-     * @notice Withdraw a chosen `amount` (partial or full).
-     *         Phase rules:
-     *          - Before enrollmentEnd: full payout on withdrawn slice (no penalty).
-     *          - Between enrollmentEnd and payoutTime:
-     *                * If this withdrawal empties the pool (i.e., after accounting, totalDeposits==0),
-     *                  NO penalty on this withdrawn slice (avoid stranding).
-     *                * Else 20% penalty on withdrawn slice -> feePool.
-     *          - After payoutTime: full payout (no penalty).
+     * Withdraw an amount of principal (partial or full).
+     * Pays out: (withdrawAmount - penalty) + full current entitlement.
      */
-    function withdraw(uint256 amount) external nonReentrant {
+    function withdraw(uint256 amount) external {
+        Account storage a = accounts[msg.sender];
         require(amount > 0, "amount=0");
+        require(a.deposited >= amount, "insufficient deposited");
 
-        Account storage user = accounts[msg.sender];
-        uint256 userDep = user.deposited;
-        require(userDep >= amount, "insufficient deposited");
-        require(totalDeposits >= amount, "pool accounting error");
+        // Harvest fees accrued so far (excludes user's own past penalties by construction)
+        _harvest(msg.sender, a);
 
-        // 1) Distribute feePool proportionally to the WITHDRAWN amount
-        //    share = (amount / totalDeposits) * feePool
-        uint256 share = 0;
-        if (feePool > 0) {
-            share = (amount * feePool) / totalDeposits;
-            if (share > 0) {
-                user.entitlement += share;
-                feePool -= share;
-                emit FeeDistributed(msg.sender, share);
-            }
-        }
+        // Determine penalty rate
+        uint256 penaltyRate = _penaltyRate(msg.sender, amount, a.deposited);
+        uint256 penalty = (amount * penaltyRate) / 100;
+        uint256 payout = amount - penalty;
 
-        // 2) Compute the entitlement slice to pay out for this partial
-        //    entitlement scales with stake; take proportional slice:
-        //    slice = user.entitlement * (amount / userDep_before)
-        //    (use userDep saved above as the "before" value)
-        uint256 slice = (user.entitlement * amount) / userDep;
-
-        // 3) Update user & pool accounting for the withdrawn amount
-        user.deposited = userDep - amount;
-        user.entitlement -= slice;
+        // Update principal & totals before distributing penalty,
+        // so last-man-standing check works correctly in future calls.
+        a.deposited -= amount;
         totalDeposits -= amount;
 
-        // 4) Determine phase & whether this makes user the last staker
-        bool emptiesPool = (totalDeposits == 0); // i.e., this withdrawal removed the last remaining stake
-
-        uint256 pay;
-        uint256 penalty;
-
-        if (block.timestamp < enrollmentEnd) {
-            // Enrollment phase: no penalty
-            pay = slice;
-        } else if (block.timestamp >= payoutTime) {
-            // Post-lock: no penalty
-            pay = slice;
-        } else {
-            // Mid-game window
-            if (emptiesPool) {
-                // Last-staker-friendly: no penalty on withdrawn slice
-                pay = slice;
-            } else {
-                // Standard 20% penalty on the withdrawn slice
-                pay = (slice * 4) / 5;
-                penalty = slice - pay; // 20%
-                feePool += penalty;
-            }
+        // Distribute penalty to others (excludes msg.sender automatically)
+        if (penalty > 0) {
+            _distributeFeeExcluding(msg.sender, penalty, a);
         }
 
-        _safeTransfer(msg.sender, pay);
+        // Pay out user's entitlement + principal less penalty
+        uint256 toPay = payout + a.entitlement;
+        if (toPay > 0) {
+            token.safeTransfer(msg.sender, toPay);
+            emit FeeDistributed(msg.sender, a.entitlement);
+            a.entitlement = 0;
+        }
 
-        if (user.deposited == 0) {
-            emit WithdrawnAll(msg.sender, pay, penalty);
+        // Update rewardDebt to new base
+        a.rewardDebt = (a.deposited * accFeePerShare) / ACC_PRECISION;
+
+        if (a.deposited == 0) {
+            emit WithdrawnAll(msg.sender, toPay, penalty);
         } else {
-            emit PartialWithdrawn(msg.sender, amount, pay, penalty);
+            emit PartialWithdrawn(msg.sender, amount, toPay, penalty);
         }
     }
 
-    // ---------- Internal safe transfer helpers ----------
+    // ----- Internals -----
 
-    function _safeTransfer(address to, uint256 amount) internal {
-        if (amount == 0) return;
-        bool ok = token.transfer(to, amount);
-        require(ok, "transfer failed");
+    function _penaltyRate(address user, uint256 /*amount*/, uint256 userDeposited) internal view returns (uint256) {
+        // Last man standing (only staker): no penalty anytime
+        if (totalDeposits == userDeposited) return 0;
+
+        // Before enrollment end: no penalty
+        if (block.timestamp <= enrollmentEnd) return 0;
+
+        // After payout time: no penalty
+        if (block.timestamp >= payoutTime) return 0;
+
+        // Otherwise during lock window: 20%
+        return 20;
     }
 
-    function _safeTransferFrom(address from, address to, uint256 amount) internal {
+    function _pending(address user, Account storage a) internal view returns (uint256) {
+        uint256 accumulated = (a.deposited * accFeePerShare) / ACC_PRECISION;
+        if (accumulated <= a.rewardDebt) return 0;
+        return accumulated - a.rewardDebt;
+    }
+
+    function _harvest(address user, Account storage a) internal {
+        uint256 pending = _pending(user, a);
+        if (pending > 0) {
+            // Move from global pool to user's entitlement
+            // (feePool tracks undistributed—reduce as we harvest)
+            feePool -= pending;
+            a.entitlement += pending;
+        }
+        // Sync reward debt to current index
+        a.rewardDebt = (a.deposited * accFeePerShare) / ACC_PRECISION;
+    }
+
+    /**
+     * Distribute a penalty amount to all stakers EXCEPT `excluder`.
+     * Implements: acc += amount / (totalDeposits - excluderDeposit)
+     * and offsets excluder's rewardDebt so they don't accrue from their own penalty.
+     */
+    function _distributeFeeExcluding(address excluder, uint256 amount, Account storage exAcc) internal {
         if (amount == 0) return;
-        bool ok = token.transferFrom(from, to, amount);
-        require(ok, "transferFrom failed");
+
+        uint256 base = totalDeposits; // NOTE: at this point we've already reduced totalDeposits for caller's withdrawal
+        uint256 exclDeposit = exAcc.deposited;
+        // baseExcl is the pool of recipients (everyone except excluder)
+        uint256 baseExcl = base - exclDeposit;
+
+        // If no one else to receive (should only happen if excluder is sole staker),
+        // do nothing here: but _penaltyRate() ensures penalty=0 in that case.
+        if (baseExcl == 0) return;
+
+        // Increase acc for everyone
+        uint256 delta = (amount * ACC_PRECISION) / baseExcl;
+        accFeePerShare += delta;
+
+        // Offset excluder’s potential accrual from this delta
+        // so that pending = deposited*acc - rewardDebt doesn't include their own penalty
+        exAcc.rewardDebt += (exAcc.deposited * delta) / ACC_PRECISION;
+
+        // Track pool growth for visibility; it will shrink as users harvest
+        feePool += amount;
     }
 }
